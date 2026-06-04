@@ -1,0 +1,12 @@
+[Unit]
+Description=Kali Lab Dynamic Initialization
+After=network.target tailscaled.service
+
+[Service]
+Type=oneshot
+EnvironmentFile=/etc/lab-environment
+ExecStart=/usr/local/bin/lab-init.sh
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
