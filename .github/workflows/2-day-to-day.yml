@@ -1,0 +1,90 @@
+name: 2. Launch Kali Remote Lab
+on:
+  workflow_dispatch:
+    inputs:
+      lab_duration_hours:
+        description: 'Select lab operational duration (Hours)'
+        required: true
+        default: '2'
+        type: choice
+        options: ['1', '2', '3', '4', '5']
+jobs:
+  run-lab:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - name: Maximize Runner Storage
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache
+          sudo apt-get clean
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+      - name: Pull Latest Saved State
+        run: docker pull ${{ secrets.DOCKER_USERNAME }}/cyber-lab:latest
+      - name: Optimize Host Network Stack
+        run: |
+          sudo sysctl -w net.ipv4.tcp_window_scaling=1
+          sudo sysctl -w net.ipv6.conf.all.disable_ipv6=1
+      - name: Initialize VM-Parity Container
+        run: |
+          docker run -d --privileged --network host --ipc host \
+          --device /dev/fuse -v /sys/fs/cgroup:/sys/fs/cgroup:rw \
+          --cgroupns host --security-opt apparmor=unconfined \
+          --shm-size 4g --ulimit nofile=100000:100000 \
+          -e TAILSCALE_AUTHKEY=${{ secrets.TAILSCALE_AUTHKEY }} \
+          -e ROOT_PASSWORD=${{ secrets.KALI_ROOT_PASSWORD }} \
+          --name cyber-lab-container \
+          ${{ secrets.DOCKER_USERNAME }}/cyber-lab:latest
+      - name: Verify Container Integrity
+        run: |
+          sleep 5
+          if [ "$(docker inspect -f '{{.State.Running}}' cyber-lab-container)" != "true" ]; then
+            echo "CRITICAL: Container terminated unexpectedly."
+            docker logs cyber-lab-container
+            exit 1
+          fi
+      - name: Telemetry Loop & Auto-Save Monitor
+        run: |
+          HOURS=${{ inputs.lab_duration_hours }}
+          MAX_SECONDS=$((HOURS * 3600))
+          START_TIME=$(date +%s)
+          while true; do
+            CURRENT_TIME=$(date +%s)
+            ELAPSED=$((CURRENT_TIME - START_TIME))
+            if [ "$ELAPSED" -ge "$MAX_SECONDS" ]; then
+              echo "Timeout reached. Initiating auto-save."
+              break
+            fi
+            if docker exec cyber-lab-container test -f /root/Desktop/close.txt; then
+              echo "Signal file detected. Initiating teardown."
+              break
+            fi
+            sleep 30
+          done
+      - name: Squash Layers & Push Persistence
+        if: always()
+        run: |
+          if docker ps -a --format '{{.Names}}' | grep -q '^cyber-lab-container$'; then
+            docker exec cyber-lab-container rm -f /root/Desktop/close.txt || true
+            docker stop -t 45 cyber-lab-container || true
+            IMAGE_TAG="${{ secrets.DOCKER_USERNAME }}/cyber-lab"
+            RUN_TAG="${IMAGE_TAG}:run-${{ github.run_id }}"
+            LATEST_TAG="${IMAGE_TAG}:latest"
+            echo "Exporting flat filesystem (Squashing layers)..."
+            docker export cyber-lab-container > state.tar
+            echo "Rebuilding un-bloated image..."
+            cat <<< 'EOF' > Dockerfile.squash
+            FROM scratch
+            ADD state.tar /
+            ENV DEBIAN_FRONTEND=noninteractive
+            EXPOSE 3389
+            ENTRYPOINT ["/entrypoint.sh"]
+            EOF
+            docker build -f Dockerfile.squash -t $RUN_TAG .
+            docker tag $RUN_TAG $LATEST_TAG
+            docker push $RUN_TAG
+            docker push $LATEST_TAG
+          fi
