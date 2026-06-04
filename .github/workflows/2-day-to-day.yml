@@ -73,6 +73,7 @@ jobs:
           
       - name: Halt & Commit Fallback Matrix
         if: always()
+        continue-on-error: true
         run: |
           if docker ps -a --format '{{.Names}}' | grep -q '^cyber-lab-container$'; then
             docker exec cyber-lab-container rm -f /root/Desktop/close.txt || true
@@ -107,6 +108,7 @@ jobs:
 
       - name: Push Persistence Data (Optimal Route)
         if: always() && steps.squash.outcome == 'success'
+        continue-on-error: true
         run: |
           IMAGE_TAG="${{ secrets.DOCKER_USERNAME }}/cyber-lab"
           echo "Squash operation verified. Pushing optimized layers."
@@ -115,6 +117,7 @@ jobs:
 
       - name: Push Persistence Data (Failsafe Route)
         if: always() && steps.squash.outcome != 'success'
+        continue-on-error: true
         run: |
           IMAGE_TAG="${{ secrets.DOCKER_USERNAME }}/cyber-lab"
           echo "CRITICAL: Squash operation failed. Reverting to standard commit logic."
