@@ -1,4 +1,5 @@
 name: 2. Launch Kali Remote Lab
+
 on:
   workflow_dispatch:
     inputs:
@@ -8,6 +9,18 @@ on:
         default: '2'
         type: choice
         options: ['1', '2', '3', '4', '5']
+      tailscale_mtu:
+        description: 'Tailnet MTU for cellular links'
+        required: true
+        default: '1280'
+        type: choice
+        options: ['1280', '1360']
+      client_tailnet_ip:
+        description: 'Optional client Tailnet IP for path diagnostics'
+        required: false
+        default: ''
+        type: string
+
 jobs:
   run-lab:
     runs-on: ubuntu-latest
@@ -17,41 +30,77 @@ jobs:
         run: |
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache
           sudo apt-get clean
-          
+          df -h
+
       - name: Log in to Docker Hub
         uses: docker/login-action@v3
         with:
           username: ${{ secrets.DOCKER_USERNAME }}
           password: ${{ secrets.DOCKER_PASSWORD }}
-          
+
       - name: Pull Latest Saved State
         run: docker pull ${{ secrets.DOCKER_USERNAME }}/cyber-lab:latest
-        
-      - name: Optimize Host Network Stack
+
+      - name: Optimize Host Network Stack For Cellular
         run: |
-          sudo sysctl -w net.ipv4.tcp_window_scaling=1
-          sudo sysctl -w net.ipv6.conf.all.disable_ipv6=1
-          
+          # Keep TCP window scaling enabled.
+          sudo sysctl -w net.ipv4.tcp_window_scaling=1 || true
+
+          # Do not disable IPv6. Cellular carriers often provide better IPv6 paths than IPv4 paths.
+          sudo sysctl -w net.ipv6.conf.all.disable_ipv6=0 || true
+          sudo sysctl -w net.ipv6.conf.default.disable_ipv6=0 || true
+
+          # BBR/FQ helps when Tailscale falls back to TCP/DERP-style relaying or when the runner pushes large state.
+          sudo modprobe tcp_bbr || true
+          sudo sysctl -w net.core.default_qdisc=fq || true
+          sudo sysctl -w net.ipv4.tcp_congestion_control=bbr || true
+
+          # Larger socket buffers smooth bursty mobile links and reduce avoidable stalls.
+          sudo sysctl -w net.core.rmem_max=134217728 || true
+          sudo sysctl -w net.core.wmem_max=134217728 || true
+          sudo sysctl -w net.core.rmem_default=262144 || true
+          sudo sysctl -w net.core.wmem_default=262144 || true
+          sudo sysctl -w net.ipv4.udp_rmem_min=8192 || true
+          sudo sysctl -w net.ipv4.udp_wmem_min=8192 || true
+
       - name: Initialize VM-Parity Container
         run: |
           docker run -d --privileged --network host --ipc host \
-          --device /dev/fuse -v /sys/fs/cgroup:/sys/fs/cgroup:rw \
-          --cgroupns host --security-opt apparmor=unconfined \
-          --shm-size 4g --ulimit nofile=100000:100000 \
-          -e TAILSCALE_AUTHKEY=${{ secrets.TAILSCALE_AUTHKEY }} \
-          -e ROOT_PASSWORD=${{ secrets.KALI_ROOT_PASSWORD }} \
-          --name cyber-lab-container \
-          ${{ secrets.DOCKER_USERNAME }}/cyber-lab:latest
-          
+            --device /dev/fuse -v /sys/fs/cgroup:/sys/fs/cgroup:rw \
+            --cgroupns host --security-opt apparmor=unconfined \
+            --shm-size=4g --ulimit nofile=100000:100000 \
+            -e TAILSCALE_AUTHKEY="${{ secrets.TAILSCALE_AUTHKEY }}" \
+            -e ROOT_PASSWORD="${{ secrets.KALI_ROOT_PASSWORD }}" \
+            -e GITHUB_RUN_ID="${{ github.run_id }}" \
+            -e TAILSCALE_MTU="${{ inputs.tailscale_mtu }}" \
+            -e TAILSCALE_HOSTNAME="kali-${{ github.run_id }}" \
+            --name cyber-lab-container \
+            ${{ secrets.DOCKER_USERNAME }}/cyber-lab:latest
+
       - name: Verify Container Integrity
         run: |
-          sleep 5
+          sleep 8
           if [ "$(docker inspect -f '{{.State.Running}}' cyber-lab-container)" != "true" ]; then
             echo "CRITICAL: Container terminated unexpectedly."
             docker logs cyber-lab-container
             exit 1
           fi
-          
+
+      - name: Tailscale Path Diagnostics
+        run: |
+          echo "==== tailscale netcheck ===="
+          docker exec cyber-lab-container tailscale netcheck || true
+          echo "==== tailscale status ===="
+          docker exec cyber-lab-container tailscale status || true
+
+          CLIENT_IP="${{ inputs.client_tailnet_ip }}"
+          if [ -n "$CLIENT_IP" ]; then
+            echo "==== tailscale ping to client: $CLIENT_IP ===="
+            docker exec cyber-lab-container tailscale ping --c 10 "$CLIENT_IP" || true
+          else
+            echo "No client_tailnet_ip provided; skipping direct/DERP ping test."
+          fi
+
       - name: Telemetry Loop & Auto-Save Monitor
         run: |
           HOURS=${{ inputs.lab_duration_hours }}
@@ -68,11 +117,11 @@ jobs:
               echo "Signal file detected. Initiating teardown."
               break
             fi
-            sleep 30
+            sleep 10
           done
-          
+
       - name: Halt & Commit Fallback Matrix
-        if: always()
+        if: ${{ always() }}
         continue-on-error: true
         run: |
           if docker ps -a --format '{{.Names}}' | grep -q '^cyber-lab-container$'; then
@@ -84,15 +133,20 @@ jobs:
 
       - name: Squash Container Filesystem
         id: squash
-        if: always()
+        if: ${{ always() }}
         continue-on-error: true
         run: |
+          if ! docker ps -a --format '{{.Names}}' | grep -q '^cyber-lab-container$'; then
+            echo "Container not found; cannot export state."
+            exit 1
+          fi
+
           IMAGE_TAG="${{ secrets.DOCKER_USERNAME }}/cyber-lab"
           RUN_TAG="${IMAGE_TAG}:run-${{ github.run_id }}"
-          
+
           echo "Exporting flat filesystem..."
           docker export cyber-lab-container > state.tar
-          
+
           echo "Generating Dockerfile configuration..."
           cat << 'EOF' > Dockerfile.squash
           FROM scratch
@@ -101,26 +155,26 @@ jobs:
           EXPOSE 3389
           ENTRYPOINT ["/entrypoint.sh"]
           EOF
-          
+
           echo "Building zero-layer architecture..."
-          docker build -f Dockerfile.squash -t $RUN_TAG .
-          docker tag $RUN_TAG ${IMAGE_TAG}:latest
+          docker build -f Dockerfile.squash -t "$RUN_TAG" .
+          docker tag "$RUN_TAG" "${IMAGE_TAG}:latest"
 
       - name: Push Persistence Data (Optimal Route)
-        if: always() && steps.squash.outcome == 'success'
+        if: ${{ always() && steps.squash.outcome == 'success' }}
         continue-on-error: true
         run: |
           IMAGE_TAG="${{ secrets.DOCKER_USERNAME }}/cyber-lab"
-          echo "Squash operation verified. Pushing optimized layers."
-          docker push ${IMAGE_TAG}:run-${{ github.run_id }}
-          docker push ${IMAGE_TAG}:latest
+          echo "Squash operation verified. Pushing optimized exact-state image."
+          docker push "${IMAGE_TAG}:run-${{ github.run_id }}"
+          docker push "${IMAGE_TAG}:latest"
 
       - name: Push Persistence Data (Failsafe Route)
-        if: always() && steps.squash.outcome != 'success'
+        if: ${{ always() && steps.squash.outcome != 'success' }}
         continue-on-error: true
         run: |
           IMAGE_TAG="${{ secrets.DOCKER_USERNAME }}/cyber-lab"
           echo "CRITICAL: Squash operation failed. Reverting to standard commit logic."
-          docker tag ${IMAGE_TAG}:fallback-${{ github.run_id }} ${IMAGE_TAG}:latest
-          docker push ${IMAGE_TAG}:fallback-${{ github.run_id }}
-          docker push ${IMAGE_TAG}:latest
+          docker tag "${IMAGE_TAG}:fallback-${{ github.run_id }}" "${IMAGE_TAG}:latest"
+          docker push "${IMAGE_TAG}:fallback-${{ github.run_id }}"
+          docker push "${IMAGE_TAG}:latest"

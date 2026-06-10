@@ -1,6 +1,7 @@
 [Unit]
 Description=Kali Lab Dynamic Initialization
 After=network.target tailscaled.service
+Wants=tailscaled.service
 
 [Service]
 Type=oneshot

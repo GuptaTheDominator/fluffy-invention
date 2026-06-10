@@ -1,0 +1,148 @@
+name: 3. Apply Optimizations To Current Saved Image
+
+on:
+  workflow_dispatch:
+
+jobs:
+  patch-current-image:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+
+      - name: Pull Current Saved State
+        run: docker pull ${{ secrets.DOCKER_USERNAME }}/cyber-lab:latest
+
+      - name: Start Current Image In Maintenance Mode
+        run: |
+          docker run -d \
+            --name cyber-lab-migrate \
+            --entrypoint /bin/bash \
+            ${{ secrets.DOCKER_USERNAME }}/cyber-lab:latest \
+            -lc 'sleep infinity'
+
+      - name: Copy Optimized Runtime Scripts Into Current Image
+        run: |
+          docker cp ./.kali-lab/entrypoint.sh cyber-lab-migrate:/entrypoint.sh
+          docker cp ./.kali-lab/lab-init.sh cyber-lab-migrate:/usr/local/bin/lab-init.sh
+          docker cp ./.kali-lab/lab-init.service cyber-lab-migrate:/etc/systemd/system/lab-init.service
+          docker exec cyber-lab-migrate chmod +x /entrypoint.sh /usr/local/bin/lab-init.sh
+
+      - name: Patch XRDP, XFCE, Tailscale Runtime Optimizations
+        run: |
+          cat > patch-current-image.sh <<'PATCH'
+          #!/bin/bash
+          set -eux
+
+          XRDP_INI=/etc/xrdp/xrdp.ini
+
+          ensure_setting() {
+            section="$1"
+            key="$2"
+            value="$3"
+            file="$4"
+
+            if grep -q "^${key}=" "$file"; then
+              sed -i "s|^${key}=.*|${key}=${value}|" "$file"
+            elif grep -q "^\[${section}\]" "$file"; then
+              sed -i "/^\[${section}\]/a ${key}=${value}" "$file"
+            else
+              printf '\n[%s]\n%s=%s\n' "$section" "$key" "$value" >> "$file"
+            fi
+          }
+
+          ensure_setting Globals crypt_level low "$XRDP_INI"
+          ensure_setting Globals security_layer rdp "$XRDP_INI"
+          ensure_setting Globals max_bpp 16 "$XRDP_INI"
+          ensure_setting Globals xserverbpp 16 "$XRDP_INI"
+          ensure_setting Globals bitmap_compression true "$XRDP_INI"
+          ensure_setting Globals bulk_compression true "$XRDP_INI"
+          ensure_setting Globals use_fastpath both "$XRDP_INI"
+          ensure_setting Globals tcp_nodelay true "$XRDP_INI"
+          ensure_setting Globals tcp_keepalive true "$XRDP_INI"
+          ensure_setting Globals tcp_send_buffer_bytes 4194304 "$XRDP_INI"
+          ensure_setting Globals tcp_recv_buffer_bytes 4194304 "$XRDP_INI"
+
+          ensure_setting Channels rdpdr false "$XRDP_INI"
+          ensure_setting Channels rdpsnd false "$XRDP_INI"
+          ensure_setting Channels drdynvc false "$XRDP_INI"
+          ensure_setting Channels cliprdr true "$XRDP_INI"
+          ensure_setting Channels rail false "$XRDP_INI"
+          ensure_setting Channels xrdpvr false "$XRDP_INI"
+          ensure_setting Channels tcutils false "$XRDP_INI"
+
+          cat > /etc/xrdp/startwm.sh <<'EOF'
+          #!/bin/sh
+
+          export XDG_SESSION_DESKTOP=xfce
+          export XDG_CURRENT_DESKTOP=XFCE
+          export LIBGL_ALWAYS_SOFTWARE=1
+          export GALLIUM_DRIVER=llvmpipe
+          export NO_AT_BRIDGE=1
+
+          xset s off -dpms 2>/dev/null || true
+
+          exec dbus-run-session -- sh -c '
+            xfconf-query -c xfwm4 -p /general/use_compositing -n -t bool -s false >/dev/null 2>&1 || true
+            xfconf-query -c xfwm4 -p /general/box_move -n -t bool -s true >/dev/null 2>&1 || true
+            xfconf-query -c xfwm4 -p /general/box_resize -n -t bool -s true >/dev/null 2>&1 || true
+            xfconf-query -c xfwm4 -p /general/cycle_preview -n -t bool -s false >/dev/null 2>&1 || true
+            xfconf-query -c xfwm4 -p /general/workspace_count -n -t int -s 1 >/dev/null 2>&1 || true
+            xfconf-query -c xfce4-desktop -p /backdrop/screen0/monitor0/image-show -n -t bool -s false >/dev/null 2>&1 || true
+            xfconf-query -c xfce4-desktop -p /backdrop/screen0/monitor0/color-style -n -t int -s 0 >/dev/null 2>&1 || true
+            xfconf-query -c thunar -p /misc-thumbnail-mode -n -t string -s THUNAR_THUMBNAIL_MODE_NEVER >/dev/null 2>&1 || true
+            exec startxfce4
+          '
+          EOF
+          chmod +x /etc/xrdp/startwm.sh
+
+          rm -f \
+            /etc/xdg/autostart/xfce4-power-manager.desktop \
+            /etc/xdg/autostart/light-locker.desktop \
+            /etc/xdg/autostart/xscreensaver.desktop \
+            /etc/xdg/autostart/blueman.desktop \
+            /etc/xdg/autostart/nm-applet.desktop \
+            /etc/xdg/autostart/print-applet.desktop \
+            /etc/xdg/autostart/pulseaudio.desktop \
+            /etc/xdg/autostart/geoclue-demo-agent.desktop \
+            || true
+
+          rm -f /etc/systemd/system/display-manager.service || true
+
+          systemctl enable xrdp tailscaled lab-init.service 2>/dev/null || true
+          systemctl set-default multi-user.target 2>/dev/null || true
+          PATCH
+
+          sed -i 's/^          //' patch-current-image.sh
+          docker cp patch-current-image.sh cyber-lab-migrate:/tmp/patch-current-image.sh
+          docker exec cyber-lab-migrate bash /tmp/patch-current-image.sh
+
+      - name: Export And Push Optimized Current State
+        run: |
+          IMAGE_TAG="${{ secrets.DOCKER_USERNAME }}/cyber-lab"
+          RUN_TAG="${IMAGE_TAG}:optimized-${{ github.run_id }}"
+
+          docker stop -t 15 cyber-lab-migrate || true
+
+          echo "Exporting patched current image state..."
+          docker export cyber-lab-migrate > state.tar
+
+          cat > Dockerfile.squash <<'EOF'
+          FROM scratch
+          ADD state.tar /
+          ENV DEBIAN_FRONTEND=noninteractive
+          EXPOSE 3389
+          ENTRYPOINT ["/entrypoint.sh"]
+          EOF
+
+          docker build -f Dockerfile.squash -t "$RUN_TAG" .
+          docker tag "$RUN_TAG" "${IMAGE_TAG}:latest"
+          docker push "$RUN_TAG"
+          docker push "${IMAGE_TAG}:latest"
